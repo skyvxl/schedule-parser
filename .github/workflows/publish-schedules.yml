@@ -1,0 +1,81 @@
+name: Publish schedules
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      SCHEDULE_LOGIN: ${{ secrets.SCHEDULE_LOGIN }}
+      SCHEDULE_PASSWORD: ${{ secrets.SCHEDULE_PASSWORD }}
+      PUBLISH_BRANCH: schedules
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate required secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${SCHEDULE_LOGIN}"
+          test -n "${SCHEDULE_PASSWORD}"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install pdfplumber
+
+      - name: Generate schedules
+        shell: bash
+        run: |
+          set -euo pipefail
+          python main.py
+
+          if ! find pdfs -maxdepth 1 -type f -name '*.json' | grep -q .; then
+            echo "No JSON files were generated in pdfs/" >&2
+            exit 1
+          fi
+
+      - name: Publish JSON files to schedules branch
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          publish_dir="$(mktemp -d)"
+          find pdfs -maxdepth 1 -type f -name '*.json' -print0 | while IFS= read -r -d '' file; do
+            cp "$file" "$publish_dir/"
+          done
+
+          if ! find "$publish_dir" -maxdepth 1 -type f -name '*.json' | grep -q .; then
+            echo "Nothing to publish" >&2
+            exit 1
+          fi
+
+          cd "$publish_dir"
+          git init
+          git checkout -b "${PUBLISH_BRANCH}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add --all
+          git commit -m "Update schedules"
+
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push --force origin "${PUBLISH_BRANCH}"
