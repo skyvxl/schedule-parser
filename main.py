@@ -3,22 +3,25 @@ from __future__ import annotations
 import json
 import os
 import re
-from html import unescape
 from dataclasses import dataclass
+from html import unescape
 from html.parser import HTMLParser
 from http.cookiejar import CookieJar
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, unquote, urljoin, urlsplit
 from urllib.request import HTTPCookieProcessor, OpenerDirector, Request, build_opener
+
+from pdf_parser import parse_pdf, write_parsed_json
 
 BASE_URL = "https://edu.stankin.ru"
 LOGIN_URL = f"{BASE_URL}/login/index.php"
 COURSE_URL = f"{BASE_URL}/course/view.php?id=11557"
 DEFAULT_TIMEOUT = 20
 AUTH_COOKIES_PATH = Path("auth_cookies.json")
-COURSE_HTML_PATH = Path("course_11557.html")
 SCHEDULE_LINKS_PATH = Path("schedule_links.json")
+PDFS_DIR = Path("pdfs")
+GROUPS_INDEX_PATH = PDFS_DIR / "groups.json"
 DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -96,6 +99,13 @@ class ScheduleLink:
     url: str
 
 
+@dataclass(slots=True)
+class PDFLink:
+    title: str
+    url: str
+    filename: str
+
+
 class LoginPageParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
@@ -150,6 +160,62 @@ class LoginPageParser(HTMLParser):
             hidden_inputs=self.hidden_inputs,
             sesskey=sesskey_match.group(1) if sesskey_match else None,
         )
+
+
+class FolderPageParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._active_href: str | None = None
+        self._active_text: list[str] = []
+        self._seen_urls: set[str] = set()
+        self.pdf_links: list[PDFLink] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "a":
+            return
+        href = dict(attrs).get("href")
+        if not href:
+            return
+        self._active_href = href
+        self._active_text = []
+
+    def handle_data(self, data: str) -> None:
+        if self._active_href is None:
+            return
+        self._active_text.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag != "a" or self._active_href is None:
+            return
+
+        href = unescape(self._active_href).strip()
+        title = re.sub(r"\s+", " ", unescape("".join(self._active_text))).strip()
+        filename = self._extract_filename(href, title)
+
+        if filename and href not in self._seen_urls:
+            self._seen_urls.add(href)
+            self.pdf_links.append(
+                PDFLink(
+                    title=title or filename,
+                    url=urljoin(BASE_URL, href),
+                    filename=filename,
+                )
+            )
+
+        self._active_href = None
+        self._active_text = []
+
+    @staticmethod
+    def _extract_filename(href: str, title: str) -> str | None:
+        title_name = title.strip()
+        if title_name.lower().endswith(".pdf"):
+            return Path(title_name).name
+
+        path_name = Path(unquote(urlsplit(href).path)).name
+        if path_name.lower().endswith(".pdf"):
+            return path_name
+
+        return None
 
 
 class StankinClient:
@@ -207,6 +273,12 @@ class StankinClient:
 
     def fetch_course_page(self) -> HTTPResult:
         return self._request(COURSE_URL, "GET")
+
+    def fetch_page(self, url: str, *, referer: str | None = None) -> HTTPResult:
+        headers: dict[str, str] = {}
+        if referer:
+            headers["Referer"] = referer
+        return self._request(url, "GET", headers=headers or None)
 
     def export_cookies(self) -> list[dict[str, str]]:
         cookies: list[dict[str, str]] = []
@@ -302,6 +374,11 @@ class StankinClient:
 
         return links
 
+    def parse_folder_pdf_links(self, html: str) -> list[PDFLink]:
+        parser = FolderPageParser()
+        parser.feed(html)
+        return parser.pdf_links
+
     def _request(
         self,
         url: str,
@@ -329,6 +406,103 @@ class StankinClient:
             raise RuntimeError(f"Network error for {url}: {exc.reason}") from exc
 
 
+def schedule_links_payload(items: list[ScheduleLink]) -> list[dict[str, str | None]]:
+    return [
+        {
+            "section": item.section,
+            "context": item.context,
+            "title": item.title,
+            "url": item.url,
+        }
+        for item in items
+    ]
+
+
+def group_json_path(group_name: str) -> Path:
+    return PDFS_DIR / f"{group_name}.json"
+
+
+def sync_pdfs(client: StankinClient, schedule_links: list[ScheduleLink]) -> dict[str, object]:
+    PDFS_DIR.mkdir(exist_ok=True)
+
+    groups_index: dict[str, dict[str, str]] = {}
+    folder_reports: list[dict[str, object]] = []
+    errors: list[dict[str, str]] = []
+    duplicates: list[str] = []
+    downloaded_count = 0
+
+    for folder in schedule_links:
+        try:
+            folder_page = client.fetch_page(folder.url, referer=COURSE_URL)
+            pdf_links = client.parse_folder_pdf_links(folder_page.text)
+        except Exception as exc:
+            errors.append(
+                {
+                    "scope": "folder",
+                    "folder_url": folder.url,
+                    "message": str(exc),
+                }
+            )
+            continue
+
+        folder_reports.append(
+            {
+                "section": folder.section,
+                "context": folder.context,
+                "title": folder.title,
+                "url": folder.url,
+                "pdf_count": len(pdf_links),
+            }
+        )
+
+        for pdf_link in pdf_links:
+            group_name = Path(pdf_link.filename).stem
+            pdf_path = PDFS_DIR / f"{group_name}.pdf"
+            json_path = group_json_path(group_name)
+
+            if group_name in groups_index:
+                duplicates.append(group_name)
+                continue
+
+            try:
+                pdf_result = client.fetch_page(pdf_link.url, referer=folder.url)
+                pdf_path.write_bytes(pdf_result.body)
+
+                parsed = parse_pdf(pdf_path)
+                write_parsed_json(pdf_path, parsed, output_path=json_path)
+                groups_index[group_name] = {
+                    "group_name": group_name,
+                    "group_link": json_path.name,
+                }
+                downloaded_count += 1
+            except Exception as exc:
+                errors.append(
+                    {
+                        "scope": "pdf",
+                        "group_name": group_name,
+                        "pdf_url": pdf_link.url,
+                        "message": str(exc),
+                    }
+                )
+
+    groups_payload = sorted(groups_index.values(), key=lambda item: item["group_name"])
+    GROUPS_INDEX_PATH.write_text(
+        json.dumps(groups_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    return {
+        "pdfs_dir": str(PDFS_DIR),
+        "groups_index_path": str(GROUPS_INDEX_PATH),
+        "folders_processed": len(folder_reports),
+        "downloaded_groups": downloaded_count,
+        "groups_index_count": len(groups_payload),
+        "duplicates": sorted(set(duplicates)),
+        "errors": errors,
+        "folder_reports": folder_reports,
+    }
+
+
 def main() -> None:
     load_dotenv()
     config = Config.from_env()
@@ -344,22 +518,14 @@ def main() -> None:
     )
 
     course_page = client.fetch_course_page()
-    COURSE_HTML_PATH.write_text(course_page.text, encoding="utf-8")
-
     schedule_links = client.parse_schedule_links(course_page.text)
-    links_payload = [
-        {
-            "section": item.section,
-            "context": item.context,
-            "title": item.title,
-            "url": item.url,
-        }
-        for item in schedule_links
-    ]
+    links_payload = schedule_links_payload(schedule_links)
     SCHEDULE_LINKS_PATH.write_text(
         json.dumps(links_payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+    sync_report = sync_pdfs(client, schedule_links)
 
     print(
         json.dumps(
@@ -373,9 +539,9 @@ def main() -> None:
                 "cookies_saved_to": str(AUTH_COOKIES_PATH),
                 "course_url": course_page.url,
                 "course_status": course_page.status,
-                "course_html_saved_to": str(COURSE_HTML_PATH),
                 "schedule_links_saved_to": str(SCHEDULE_LINKS_PATH),
-                "schedule_links": links_payload,
+                "schedule_links_count": len(links_payload),
+                "sync_report": sync_report,
             },
             ensure_ascii=False,
             indent=2,

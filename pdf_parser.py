@@ -45,7 +45,8 @@ class ParsedItem:
 
 
 def normalize_text(text: str) -> str:
-    return re.sub(r"\s+", " ", unescape(text)).strip()
+    cleaned = unescape(text).replace("\x00", " ")
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
 def parse_date_token(token: str, year: int) -> date:
@@ -54,15 +55,16 @@ def parse_date_token(token: str, year: int) -> date:
 
 def expand_dates(expr: str, year: int) -> list[str]:
     dates: list[str] = []
-    for part in [chunk.strip() for chunk in expr.split(",") if chunk.strip()]:
+    normalized_expr = normalize_text(expr)
+    for part in [chunk.strip() for chunk in normalized_expr.split(",") if chunk.strip()]:
         range_match = re.fullmatch(
-            r"(\d{2}\.\d{2})-(\d{2}\.\d{2})(?:\s+(ч\.н\.|к\.н\.))?",
+            r"(\d{2}\.\d{2})-(\d{2}\.\d{2})(?:\s+([чк])\.\s*н\.?)?",
             part,
         )
         if range_match:
             current = parse_date_token(range_match.group(1), year)
             end = parse_date_token(range_match.group(2), year)
-            step_days = 14 if range_match.group(3) == "ч.н." else 7
+            step_days = 14 if range_match.group(3) == "ч" else 7
             while current <= end:
                 dates.append(current.isoformat())
                 current += timedelta(days=step_days)
