@@ -28,6 +28,8 @@ class ParsedItem:
     office: str | None
     time: list[dict[str, str]]
     dates: list[str]
+    slot_start: int
+    slot_end: int
     sort_index: float
     weekday: str = WEEKDAY_VALUE
 
@@ -41,6 +43,8 @@ class ParsedItem:
             "time": self.time,
             "dates": self.dates,
             "weekday": self.weekday,
+            "slot_start": self.slot_start,
+            "slot_end": self.slot_end,
         }
 
 
@@ -85,6 +89,8 @@ def parse_entry(
     *,
     year: int,
     sort_index: float,
+    slot_start: int,
+    slot_end: int,
 ) -> ParsedItem:
     entry_text = normalize_text(entry_text)
     date_match = re.search(r"\[(.+)\]\s*$", entry_text)
@@ -134,6 +140,8 @@ def parse_entry(
         office=office,
         time=[{"start": start, "end": end} for start, end in time_ranges],
         dates=dates,
+        slot_start=slot_start,
+        slot_end=slot_end,
         sort_index=sort_index,
     )
 
@@ -154,20 +162,35 @@ def build_time_ranges(page: pdfplumber.page.Page, table) -> list[tuple[str, str]
     return time_ranges
 
 
-def cell_time_ranges(
-    table,
+def cell_slot_metadata(
+    header_cells,
     header_ranges: list[tuple[str, str]],
     cell_bbox,
-) -> list[tuple[str, str]]:
+) -> tuple[list[tuple[str, str]], int | None, int | None]:
     x0, _, x1, _ = cell_bbox
-    ranges: list[tuple[str, str]] = []
-    for header_cell, time_range in zip(table.rows[0].cells[1:], header_ranges):
+    matches: list[tuple[int, tuple[str, str]]] = []
+    range_index = 0
+
+    for slot_index, header_cell in enumerate(header_cells):
         if header_cell is None:
             continue
+        if range_index >= len(header_ranges):
+            break
+
+        time_range = header_ranges[range_index]
+        range_index += 1
         hx0, _, hx1, _ = header_cell
         if x0 <= hx0 + 0.5 and x1 >= hx1 - 0.5:
-            ranges.append(time_range)
-    return ranges
+            matches.append((slot_index, time_range))
+
+    if not matches:
+        return [], None, None
+
+    return (
+        [time_range for _, time_range in matches],
+        matches[0][0],
+        matches[-1][0],
+    )
 
 
 def extract_entries_from_cell(cell_text: str) -> list[str]:
@@ -188,8 +211,12 @@ def parse_table(page, table, *, year: int, start_index: int) -> tuple[list[Parse
             if not cell_text or "[" not in cell_text:
                 continue
 
-            time_ranges = cell_time_ranges(table, header_ranges, cell_bbox)
-            if not time_ranges:
+            time_ranges, slot_start, slot_end = cell_slot_metadata(
+                table.rows[0].cells[1:],
+                header_ranges,
+                cell_bbox,
+            )
+            if not time_ranges or slot_start is None or slot_end is None:
                 continue
 
             for entry_text in extract_entries_from_cell(cell_text):
@@ -199,6 +226,8 @@ def parse_table(page, table, *, year: int, start_index: int) -> tuple[list[Parse
                         time_ranges,
                         year=year,
                         sort_index=float(sort_index),
+                        slot_start=slot_start,
+                        slot_end=slot_end,
                     )
                 )
                 sort_index += 1

@@ -1,3 +1,4 @@
 .env
 auth_cookies.json
 schedule_links.json
+.DS_Store
