@@ -49,5 +49,22 @@ class SlotMetadataTests(unittest.TestCase):
         )
 
 
+class TeacherParsingTests(unittest.TestCase):
+    def test_parse_entry_separates_teacher_with_full_two_word_name(self) -> None:
+        item = pdf_parser.parse_entry(
+            "Сети и телекоммуникации. Юсеф Фарах. Семинар. [17.09-08.10 к.н.]",
+            [("10:15", "11:50")],
+            year=2026,
+            sort_index=0,
+            slot_start=1,
+            slot_end=1,
+        )
+
+        payload = item.as_dict()
+
+        self.assertEqual(payload["name"], "Сети и телекоммуникации")
+        self.assertEqual(payload["teacher"], ["Юсеф Фарах"])
+
+
 if __name__ == "__main__":
     unittest.main()

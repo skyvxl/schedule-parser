@@ -112,6 +112,11 @@ def parse_entry(
         r"([А-ЯЁ][а-яё-]+\s+[А-Я]\.\s*[А-Я]\.)\s*$",
         before_type,
     )
+    if not teacher_match:
+        teacher_match = re.search(
+            r"\.\s+([А-ЯЁ][а-яё-]{1,}(?:\s+[А-ЯЁ][а-яё-]{1,}){1,2})\.?\s*$",
+            before_type,
+        )
     teacher: list[str] | None = None
     if teacher_match:
         teacher = [
